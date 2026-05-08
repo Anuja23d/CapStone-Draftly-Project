@@ -1,0 +1,15 @@
+#draftly-btn {
+    margin-left: 10px;
+    padding: 5px 10px;
+    background: #1a73e8;
+    color: white;
+    border: none;
+    cursor: pointer;
+}
+
+#draftly-ui {
+    background: #f1f3f4;
+    padding: 10px;
+    margin-top: 10px;
+    border-radius: 8px;
+}
