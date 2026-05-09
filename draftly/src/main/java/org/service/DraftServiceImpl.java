@@ -3,6 +3,8 @@ package org.service;
 import org.entity.Draft;
 import org.entity.Email;
 import org.entity.User;
+import org.exception.BadRequestException;
+import org.exception.ResourceNotFoundException;
 import org.repository.DraftRepository;
 import org.repository.EmailRepository;
 import org.repository.UserRepository;
@@ -17,6 +19,13 @@ import java.util.stream.Collectors;
 
 @Service
 public class DraftServiceImpl implements DraftService {
+
+    private static final String STATUS_PENDING = "PENDING";
+    private static final String STATUS_APPROVED = "APPROVED";
+    private static final String STATUS_REJECTED = "REJECTED";
+    private static final String STATUS_SENT = "SENT";
+    private static final String STATUS_FAILED = "FAILED";
+    private static final int MAX_SEND_ATTEMPTS = 3;
 
     @Autowired
     private AIService aiService;
@@ -36,11 +45,28 @@ public class DraftServiceImpl implements DraftService {
     @Autowired
     private UserPreferencesRepository preferencesRepository;
 
+    @Autowired
+    private LogService logService;
+
+    @Override
+    public List<Draft> getAllDrafts() {
+        return draftRepository.findAll();
+    }
+
+    @Override
+    public List<Draft> getDraftsByStatus(String status) {
+        if (status == null || status.isBlank()) {
+            throw new BadRequestException("Missing status");
+        }
+        return draftRepository.findByStatus(status.toUpperCase());
+    }
+
+    @Override
     public Draft generateDraft(String body, String userEmail) throws Exception {
 
         // 🔹 Get REAL user from DB
         User user = userRepository.findByEmail(userEmail)
-                .orElseThrow(() -> new RuntimeException("User not found"));
+                .orElseThrow(() -> new ResourceNotFoundException("User not found"));
 
         // 🔹 Fetch sent emails for tone
         List<String> sentEmails = emailService.getSentEmailBodies(user);
@@ -54,7 +80,7 @@ public class DraftServiceImpl implements DraftService {
 
         Draft draft = new Draft();
         draft.setGeneratedText(reply);
-        draft.setStatus("PENDING");
+        draft.setStatus(STATUS_PENDING);
 
         return draftRepository.save(draft);
     }
@@ -62,15 +88,15 @@ public class DraftServiceImpl implements DraftService {
     @Override
     public Draft generateDraftForEmail(Long emailId, String userEmail) throws Exception {
         if (emailId == null) {
-            throw new IllegalArgumentException("emailId is required");
+            throw new BadRequestException("emailId is required");
         }
         User user = userRepository.findByEmail(userEmail)
-                .orElseThrow(() -> new RuntimeException("User not found"));
+                .orElseThrow(() -> new ResourceNotFoundException("User not found"));
 
         Email email = emailRepository.findById(emailId)
-                .orElseThrow(() -> new RuntimeException("Email not found"));
+                .orElseThrow(() -> new ResourceNotFoundException("Email not found"));
         if (email.getUser() == null || !email.getUser().getId().equals(user.getId())) {
-            throw new RuntimeException("Email does not belong to user");
+            throw new BadRequestException("Email does not belong to user");
         }
 
         String body = email.getBody() == null ? "" : email.getBody();
@@ -85,8 +111,94 @@ public class DraftServiceImpl implements DraftService {
         Draft draft = new Draft();
         draft.setEmail(email);
         draft.setGeneratedText(reply);
-        draft.setStatus("PENDING");
+        draft.setStatus(STATUS_PENDING);
         return draftRepository.save(draft);
+    }
+
+    @Override
+    public Draft editDraft(Long draftId, String editedText) {
+        Draft draft = findDraft(draftId);
+        draft.setEditedText(editedText);
+        draft.setStatus(STATUS_PENDING);
+        return draftRepository.save(draft);
+    }
+
+    @Override
+    public Draft approveDraft(Long draftId) {
+        Draft draft = findDraft(draftId);
+        draft.setStatus(STATUS_APPROVED);
+        logService.log(draftId, STATUS_APPROVED, "Draft approved");
+        return draftRepository.save(draft);
+    }
+
+    @Override
+    public Draft rejectDraft(Long draftId) {
+        Draft draft = findDraft(draftId);
+        draft.setStatus(STATUS_REJECTED);
+        logService.log(draftId, STATUS_REJECTED, "Draft rejected");
+        return draftRepository.save(draft);
+    }
+
+    @Override
+    public Draft sendApprovedDraft(Long draftId, String email, String idempotencyKey) throws Exception {
+        if (email == null || email.isBlank()) {
+            throw new BadRequestException("Missing email");
+        }
+        if (idempotencyKey == null || idempotencyKey.isBlank()) {
+            throw new BadRequestException("Missing idempotencyKey");
+        }
+
+        Draft draft = findDraft(draftId);
+        if (!STATUS_APPROVED.equalsIgnoreCase(draft.getStatus())) {
+            throw new BadRequestException("Draft must be APPROVED before sending");
+        }
+
+        var existing = draftRepository.findByIdempotencyKey(idempotencyKey);
+        if (existing.isPresent()) {
+            return existing.get();
+        }
+
+        User user = userRepository.findByEmail(email)
+                .orElseThrow(() -> new ResourceNotFoundException("User not found"));
+
+        if (draft.getEmail() == null || draft.getEmail().getMessageId() == null) {
+            throw new BadRequestException("Draft is not linked to an Email with messageId");
+        }
+
+        String replyText = (draft.getEditedText() != null && !draft.getEditedText().isBlank())
+                ? draft.getEditedText()
+                : draft.getGeneratedText();
+
+        draft.setIdempotencyKey(idempotencyKey);
+        draftRepository.save(draft);
+
+        logService.log(draftId, "SEND_ATTEMPT", "Attempting send");
+
+        Exception last = null;
+        for (int attempt = 1; attempt <= MAX_SEND_ATTEMPTS; attempt++) {
+            try {
+                String gmailResponse = emailService.sendReply(user, draft.getEmail().getMessageId(), replyText);
+                draft.setStatus(STATUS_SENT);
+                draft.setSentMessageId(gmailResponse);
+                logService.log(draftId, STATUS_SENT, "Sent via Gmail API");
+                return draftRepository.save(draft);
+            } catch (Exception e) {
+                last = e;
+                logService.log(draftId, "SEND_RETRY_" + attempt, e.getMessage());
+            }
+        }
+
+        draft.setStatus(STATUS_FAILED);
+        draftRepository.save(draft);
+        throw new RuntimeException("Failed to send after retries: " + (last == null ? "" : last.getMessage()));
+    }
+
+    private Draft findDraft(Long draftId) {
+        if (draftId == null) {
+            throw new BadRequestException("draftId is required");
+        }
+        return draftRepository.findById(draftId)
+                .orElseThrow(() -> new ResourceNotFoundException("Draft not found"));
     }
 
     private String normalizeAndAppendSignature(String reply, String signature) {
